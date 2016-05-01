@@ -3,7 +3,6 @@
 //
 #ifndef PULLWORDS_MAIN_H
 #define PULLWORDS_MAIN_H
-#define MAXLINE 1024
 //分词结果的最大长度
 #define WORD_RESULT_LEN 200
 //可处理的最大的客户端发送的搜索词长度
@@ -17,5 +16,5 @@ struct TREE_CUT_WORDS_RESULT {
     //分词权重
     int words_weight;
 };
-
+#define printd(fmt,args) printf(__FILE__ "(%d): " fmt, __LINE__, ##args);
 #endif //PULLWORDS_MAIN_H
