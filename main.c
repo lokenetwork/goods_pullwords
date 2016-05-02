@@ -87,12 +87,6 @@ void init_tree_cut_words_data(struct TREE_CUT_WORDS_DATA *cut_words_data) {
     (*cut_words_data).remainder_words = (char *) malloc(MAX_SEARCH_WORDS_LEN);
     memset((*cut_words_data).remainder_words, 0, MAX_SEARCH_WORDS_LEN);
     (*cut_words_data).origin_remainder_words = (*cut_words_data).remainder_words;
-    /*
-    (*cut_words_data).pullword_result_queue = (LinkQueue *) malloc(sizeof(LinkQueue));
-    memset((*cut_words_data).pullword_result_queue, 0, sizeof(LinkQueue));
-    InitQueue((*cut_words_data).pullword_result_queue);
-     */
-
 }
 
 void add_words_weight(int *weight, int type) {
@@ -221,7 +215,7 @@ int8_t pecl_regx_match(PCRE2_SPTR subject, PCRE2_SPTR pattern, int *match_offset
         PCRE2_SPTR substring_start = subject + ovector[2 * i];
 
         if (i > 1) {
-            //wrong. i can't large than one.lazy do.
+            //wrong. i can't large than one.todo.
         }
     }
 }
@@ -301,7 +295,7 @@ int _tree_cut_words(struct TREE_CUT_WORDS_DATA *parent_cut_words_data) {
     first_chinese_word = (char *) malloc(chinese_char_byte);
     memset(first_chinese_word, 0, chinese_char_byte);
     if (!first_chinese_word) {
-        //lazy do.每一个可能的错误都要做处理或日志记录.not only malloc
+        //todo.每一个可能的错误都要做处理或日志记录.not only malloc
         printf("Not Enough Memory!/n");
     }
 
@@ -352,7 +346,7 @@ int _tree_cut_words(struct TREE_CUT_WORDS_DATA *parent_cut_words_data) {
                 strcpy(tree_cut_words_data->remainder_words, parent_cut_words_data->remainder_words);
                 *tree_cut_words_data->words_weight = *(parent_cut_words_data->words_weight);
 
-                //把pullwords主线程的data封装成一个指针，减少指针创建,lazy do.
+                //todo 把pullwords主线程的data封装成一个指针，减少指针创建,.
                 tree_cut_words_data->pullwords_result_queue = parent_cut_words_data->pullwords_result_queue;
                 tree_cut_words_data->pullwords_result_queue_write_lock = parent_cut_words_data->pullwords_result_queue_write_lock;
                 tree_cut_words_data->pullwords_cond = parent_cut_words_data->pullwords_cond;
@@ -369,7 +363,7 @@ int _tree_cut_words(struct TREE_CUT_WORDS_DATA *parent_cut_words_data) {
                     pthread_create_result = pthread_create(&pthread_id, NULL,
                                                            (void *) _tree_cut_words, tree_cut_words_data);
                     if (pthread_create_result != 0) {
-                        //deal the error,lazy do.
+                        //todo,deal the error,.
                         printf("Create pthread error!\n");
                     }
                 } else {
@@ -434,8 +428,6 @@ int _tree_cut_words(struct TREE_CUT_WORDS_DATA *parent_cut_words_data) {
     free(parent_cut_words_data->cut_word_result);
     free(parent_cut_words_data->words_weight);
     free(parent_cut_words_data->origin_remainder_words);
-    //remainder_words貌似已经做了偏移运算，不能free掉
-    //free(parent_cut_words_data->remainder_words);
     free(parent_cut_words_data);
 
 
@@ -463,13 +455,11 @@ void deal_pullwords_result_queue(LinkQueue *pullwords_result_queue, char *result
         }
         p = p->next;
     }
-    strcpy(result_words, &temporary_result_words);
+    char * not_finish_result_words = substring(temporary_result_words,1,sizeof(temporary_result_words)-1);
+    strcpy(result_words, not_finish_result_words);
+    free(not_finish_result_words);
 }
 
-/*
- * result_code 1:pull word success
- * result_code 0:pull word fail
- * */
 int pull_word(char *origin_search_words, int * connfd) {
 
     pthread_mutex_t pull_word_cond_mtx = PTHREAD_MUTEX_INITIALIZER;
@@ -501,7 +491,8 @@ int pull_word(char *origin_search_words, int * connfd) {
     *((*parent_tree_cut_words_data).pullwords_result_finish_number) = 0;
     //封装成一个函数，end
 
-    strcpy(parent_tree_cut_words_data->remainder_words, "iphoneioioioioioiaaaaa飞行员A9墨镜");
+    //strcpy(parent_tree_cut_words_data->remainder_words, "iphone6s飞行员A9墨镜");
+    strcpy(parent_tree_cut_words_data->remainder_words, origin_search_words);
 
     //加锁
     pthread_mutex_lock(&pull_word_cond_mtx);
@@ -512,34 +503,34 @@ int pull_word(char *origin_search_words, int * connfd) {
     pthread_create_result = pthread_create(&parent_thread_id, NULL,
                                            (void *) _tree_cut_words, parent_tree_cut_words_data);
 
-    //阻塞等待子进程通知
-    pthread_cond_wait(&pullwords_cond, &pull_word_cond_mtx);
+    //结果校验while，pthread_cond_wait可能被意外唤醒
+    while (*((*parent_tree_cut_words_data).pullwords_result_number) != *((*parent_tree_cut_words_data).pullwords_result_finish_number)){
+        //阻塞等待子进程通知
+        pthread_cond_wait(&pullwords_cond, &pull_word_cond_mtx);
+    }
+
 
     char last_result_words[WORD_RESULT_LEN];
     memset(last_result_words,0,WORD_RESULT_LEN);
     //接受到通知开始处理分词作业检查
-    //deal_pullwords_result_queue(pullwords_result_queue, last_result_words);
-    strcat(last_result_words,"ok\n");
+    deal_pullwords_result_queue(pullwords_result_queue, last_result_words);
+   // strcat(last_result_words,"\n");
     printf("last result_words is %s\n", last_result_words);
     free(pullwords_result_queue);
-    /*这种不会导致客户端断开
-    char respond_word[5] = "ok\n";
-    write(connfd, respond_word, 5); //write maybe fail,here don't process failed error
-    */
-    //这种会导致客户端断开
+
     write(*connfd, last_result_words, sizeof(last_result_words)); //write maybe fail,here don't process failed error
 
+    free(origin_search_words);
     return 0;
 };
 
 void deal_pullwords_request(int connfd) {
 
     size_t n;
-    int8_t result_code;
-    char search_words[MAX_SEARCH_WORDS_LEN];
-    memset(search_words, 0, MAX_SEARCH_WORDS_LEN);
+    char client_request_data[MAX_SEARCH_WORDS_LEN];
+    memset(client_request_data, 0, MAX_SEARCH_WORDS_LEN);
     for (; ;) {
-        n = read(connfd, search_words, MAX_SEARCH_WORDS_LEN);
+        n = read(connfd, client_request_data, MAX_SEARCH_WORDS_LEN);
 
         if (n < 0) {
             if (errno != EINTR) {
@@ -554,30 +545,26 @@ void deal_pullwords_request(int connfd) {
             break;
         }
         //client exit
-        if (strncmp("exit", search_words, 4) == 0) {
+        if (strncmp("exit", client_request_data, 4) == 0) {
             close(connfd);
             printf("client exit\n");
             break;
         }
 
-        printf("client input %s\n", search_words);
-        pull_word(search_words, connfd);
+        printf("client input %s\n", client_request_data);
 
-        //char respond_word[5] = "ok\n";
-        //write(connfd, respond_word, n); //write maybe fail,here don't process failed error
+        /*
+         * Todo
+         * 这里创建一个线程来处理,考虑需不需要返回原搜索词跟ip，先做hproxy代理再考虑这个
+         * */
+        char * search_words = (char *) malloc(MAX_SEARCH_WORDS_LEN);
+        memset(search_words,0,MAX_SEARCH_WORDS_LEN);
+        strcpy(search_words,client_request_data);
+        pull_word(search_words, &connfd);
     }
 }
 
 int main(int argc, char **argv) {
-    /*
-    char *search_words = (char *) malloc(MAX_SEARCH_WORDS_LEN);
-    int8_t result_code;
-    memset(search_words, 0, MAX_SEARCH_WORDS_LEN);
-    char *result_words = (char *) malloc(MAX_SEARCH_WORDS_LEN);
-    memset(result_words, 0, MAX_SEARCH_WORDS_LEN);
-    pull_word(search_words, result_words, &result_code);
-    sleep(100);
-   */
     int listenfd, connfd;
     int serverPort = 9999;
     int listenq = 1024;
