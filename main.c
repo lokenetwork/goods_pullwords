@@ -374,8 +374,6 @@ int _tree_cut_words(struct TREE_CUT_WORDS_DATA *parent_cut_words_data) {
                     strcpy(last_tree_cut_words_result->pullwords_result, tree_cut_words_data->cut_word_result);
                     last_tree_cut_words_result->words_weight = *(tree_cut_words_data->words_weight);
 
-                    //原子操作,递增完成作业数
-                    __sync_fetch_and_add((*parent_cut_words_data).pullwords_result_finish_number, 1);
 
                     //分词结束，加锁，写入分词结果到主线程的分词队列
                     pthread_mutex_lock(tree_cut_words_data->pullwords_result_queue_write_lock);
@@ -383,7 +381,7 @@ int _tree_cut_words(struct TREE_CUT_WORDS_DATA *parent_cut_words_data) {
                            *((*parent_cut_words_data).pullwords_result_number),
                            *((*parent_cut_words_data).pullwords_result_finish_number));
                     EnQueue((*tree_cut_words_data).pullwords_result_queue, last_tree_cut_words_result);
-
+                    *((*parent_cut_words_data).pullwords_result_finish_number) = (*((*parent_cut_words_data).pullwords_result_finish_number))+1;
 
                     //加锁比较pullwords_result_finish_number跟pullwords_result_number，如果全部作业完成，通知主进程
                     if (*((*parent_cut_words_data).pullwords_result_finish_number) ==
@@ -405,14 +403,12 @@ int _tree_cut_words(struct TREE_CUT_WORDS_DATA *parent_cut_words_data) {
         strcpy(last_tree_cut_words_result->pullwords_result, parent_cut_words_data->cut_word_result);
         last_tree_cut_words_result->words_weight = *(parent_cut_words_data->words_weight);
 
-        //原子操作,递增完成作业数
-        __sync_fetch_and_add((*parent_cut_words_data).pullwords_result_finish_number, 1);
 
         //分词结束，加锁，写入分词结果到主线程的分词队列
         pthread_mutex_lock(parent_cut_words_data->pullwords_result_queue_write_lock);
-
-
         EnQueue((*parent_cut_words_data).pullwords_result_queue, last_tree_cut_words_result);
+        *((*parent_cut_words_data).pullwords_result_finish_number) = (*((*parent_cut_words_data).pullwords_result_finish_number))+1;
+
         printf("pullwords_result_number is %d,pullwords_result_finish_number %d\n",
                *((*parent_cut_words_data).pullwords_result_number),
                *((*parent_cut_words_data).pullwords_result_finish_number));
@@ -424,6 +420,7 @@ int _tree_cut_words(struct TREE_CUT_WORDS_DATA *parent_cut_words_data) {
         pthread_mutex_unlock(parent_cut_words_data->pullwords_result_queue_write_lock);
 
     }
+
 
     free(parent_cut_words_data->cut_word_result);
     free(parent_cut_words_data->words_weight);
