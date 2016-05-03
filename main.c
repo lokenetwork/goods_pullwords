@@ -89,6 +89,26 @@ void init_tree_cut_words_data(struct TREE_CUT_WORDS_DATA *cut_words_data) {
     (*cut_words_data).origin_remainder_words = (*cut_words_data).remainder_words;
 }
 
+void get_search_words(char *http_request, char *search_wrods) {
+    char search_words_key[20] = "search_words";
+    char *search_words_position;
+    char *search_words_origin_position;
+    search_words_position = strstr(http_request, search_words_key);
+    search_words_origin_position = search_words_position =
+            search_words_position + strlen(search_words_key) + strlen("=");
+    int search_wrods_lenght;
+    //从这个指针位置开始读取读,取到空格要停止
+    for (int i = 0; i < MAX_SEARCH_WORDS_LEN; i++) {
+        search_words_position++;
+        if ((*search_words_position) == ' ') {
+            search_wrods_lenght = i + 1;
+            break;
+        }
+
+    };
+    strncpy(search_wrods, search_words_origin_position, search_wrods_lenght);
+}
+
 void add_words_weight(int *weight, int type) {
     switch (type) {
         case 1:
@@ -112,7 +132,7 @@ char *left(char *dst, char *src, int n) {
 }
 
 /*方法一，不改变字符串a,b, 通过malloc，生成第三个字符串c, 返回局部指针变量*/
-char *join_char(char *a, char *b) {
+char *join_char(const char *a, const char *b) {
     char *c = (char *) malloc(strlen(a) + strlen(b) + 1); //局部变量，用malloc申请内存
     memset(c, 0, strlen(a) + strlen(b) + 1);
     if (c == NULL) exit(1);
@@ -285,11 +305,62 @@ int english_word_cut(char *tree_result_word, char **search_word_point, int *word
     return 1;
 }
 
+void sendHeader(char *Status_code, char *Content_Type, int TotalSize, int socket) {
+    char *head = "\r\nHTTP/1.1 ";
+    char *content_head = "\r\nContent-Type: ";
+    char *server_head = "\r\nServer: PT06";
+    char *length_head = "\r\nContent-Length: ";
+    char *date_head = "\r\nDate: ";
+    char *newline = "\r\n";
+    char contentLength[100];
+
+    time_t rawtime;
+
+    time(&rawtime);
+
+    // int contentLength = strlen(HTML);
+    sprintf(contentLength, "%i", TotalSize);
+
+    char *message = malloc((
+                                   strlen(head) +
+                                   strlen(content_head) +
+                                   strlen(server_head) +
+                                   strlen(length_head) +
+                                   strlen(date_head) +
+                                   strlen(newline) +
+                                   strlen(Status_code) +
+                                   strlen(Content_Type) +
+                                   strlen(contentLength) +
+                                   28 +
+                                   sizeof(char)) * 2);
+
+    if (message != NULL) {
+
+        strcpy(message, head);
+
+        strcat(message, Status_code);
+
+        strcat(message, content_head);
+        strcat(message, Content_Type);
+        strcat(message, server_head);
+        strcat(message, length_head);
+        strcat(message, contentLength);
+        strcat(message, date_head);
+        strcat(message, (char *) ctime(&rawtime));
+        strcat(message, newline);
+
+        sendString(message, socket);
+
+        free(message);
+    }
+}
+
 //有多少个词条就开多少个线程来模拟分叉树算法，选出词条最多的一个或几个作为分词结果
 int _tree_cut_words(struct TREE_CUT_WORDS_DATA *parent_cut_words_data) {
 
     english_word_cut((*parent_cut_words_data).cut_word_result, &((*parent_cut_words_data).remainder_words),
                      (*parent_cut_words_data).words_weight);
+
     //取出第一个汉子，查询redis词条，for循环生产不同的父级分词结果，然后传给新建的子进程,进入递归
     char *first_chinese_word;
     first_chinese_word = (char *) malloc(chinese_char_byte);
@@ -314,23 +385,36 @@ int _tree_cut_words(struct TREE_CUT_WORDS_DATA *parent_cut_words_data) {
     free(get_word_item_cmd);
     cJSON *match_words_json = cJSON_Parse(match_words_json_str);
 
+    //是否已经到最后一个词
+    bool NEED_not_match_word_end_cut;
 
+    //有多少词条是否包含在搜索词里
+    int8_t match_words_item_number = 0;
 
     //判断是否查找到redis词条
     if (redis_reply->type == REDIS_REPLY_STRING) {
         //pullwords_result_number要先计算好有多少种结果。
-        int8_t add_result_number = -1;
         for (int tree_arg_index = 0; tree_arg_index < cJSON_GetArraySize(match_words_json); tree_arg_index++) {
             cJSON *subitem = cJSON_GetArrayItem(match_words_json, tree_arg_index);
             //判断词条是否包含在搜索词里
             if (strstr(parent_cut_words_data->remainder_words, subitem->valuestring) != NULL) {
-                add_result_number++;
+                match_words_item_number++;
             }
         };
-        printf("add_result_number is %d\n", add_result_number);
-        //pullwords_result_number要做原子操作，递增，支持并发
-        __sync_fetch_and_add((*parent_cut_words_data).pullwords_result_number, add_result_number);
+    } else {
+        NEED_not_match_word_end_cut = false;
+    }
 
+
+    if (match_words_item_number == 0) {
+        NEED_not_match_word_end_cut = true;
+    }
+
+    if (NEED_not_match_word_end_cut == false) {
+        int8_t add_result_number = 0;
+        //pullwords_result_number要做原子操作，递增，支持并发
+        add_result_number = match_words_item_number - 1;
+        __sync_fetch_and_add((*parent_cut_words_data).pullwords_result_number, add_result_number);
         for (int tree_arg_index = 0; tree_arg_index < cJSON_GetArraySize(match_words_json); tree_arg_index++) {
             cJSON *subitem = cJSON_GetArrayItem(match_words_json, tree_arg_index);
             //判断词条是否包含在搜索词里,如果在，进入树分词算法
@@ -377,11 +461,10 @@ int _tree_cut_words(struct TREE_CUT_WORDS_DATA *parent_cut_words_data) {
 
                     //分词结束，加锁，写入分词结果到主线程的分词队列
                     pthread_mutex_lock(tree_cut_words_data->pullwords_result_queue_write_lock);
-                    printf("pullwords_result_number is %d,pullwords_result_finish_number %d\n",
-                           *((*parent_cut_words_data).pullwords_result_number),
-                           *((*parent_cut_words_data).pullwords_result_finish_number));
+
                     EnQueue((*tree_cut_words_data).pullwords_result_queue, last_tree_cut_words_result);
-                    *((*parent_cut_words_data).pullwords_result_finish_number) = (*((*parent_cut_words_data).pullwords_result_finish_number))+1;
+                    *((*parent_cut_words_data).pullwords_result_finish_number) =
+                            (*((*parent_cut_words_data).pullwords_result_finish_number)) + 1;
 
                     //加锁比较pullwords_result_finish_number跟pullwords_result_number，如果全部作业完成，通知主进程
                     if (*((*parent_cut_words_data).pullwords_result_finish_number) ==
@@ -394,6 +477,7 @@ int _tree_cut_words(struct TREE_CUT_WORDS_DATA *parent_cut_words_data) {
 
         }
     } else {
+        //首汉子没有匹配到字典词条 OR 没有查找到redis词条，选取剩下的字作为一个半词
         not_match_word_end_cut(parent_cut_words_data->cut_word_result, &(parent_cut_words_data->remainder_words),
                                parent_cut_words_data->words_weight);
         //创建线程最终分词结果，写入主线程队列
@@ -404,21 +488,20 @@ int _tree_cut_words(struct TREE_CUT_WORDS_DATA *parent_cut_words_data) {
         last_tree_cut_words_result->words_weight = *(parent_cut_words_data->words_weight);
 
 
+
         //分词结束，加锁，写入分词结果到主线程的分词队列
         pthread_mutex_lock(parent_cut_words_data->pullwords_result_queue_write_lock);
         EnQueue((*parent_cut_words_data).pullwords_result_queue, last_tree_cut_words_result);
-        *((*parent_cut_words_data).pullwords_result_finish_number) = (*((*parent_cut_words_data).pullwords_result_finish_number))+1;
+        *((*parent_cut_words_data).pullwords_result_finish_number) =
+                (*((*parent_cut_words_data).pullwords_result_finish_number)) + 1;
 
-        printf("pullwords_result_number is %d,pullwords_result_finish_number %d\n",
-               *((*parent_cut_words_data).pullwords_result_number),
-               *((*parent_cut_words_data).pullwords_result_finish_number));
+
         //加锁比较pullwords_result_finish_number跟pullwords_result_number，如果全部作业完成，通知主进程
         if (*((*parent_cut_words_data).pullwords_result_finish_number) ==
             *((*parent_cut_words_data).pullwords_result_number)) {
             pthread_cond_signal((*parent_cut_words_data).pullwords_cond);
         }
         pthread_mutex_unlock(parent_cut_words_data->pullwords_result_queue_write_lock);
-
     }
 
 
@@ -452,12 +535,12 @@ void deal_pullwords_result_queue(LinkQueue *pullwords_result_queue, char *result
         }
         p = p->next;
     }
-    char * not_finish_result_words = substring(temporary_result_words,1,sizeof(temporary_result_words)-1);
+    char *not_finish_result_words = substring(temporary_result_words, 1, sizeof(temporary_result_words) - 1);
     strcpy(result_words, not_finish_result_words);
     free(not_finish_result_words);
 }
 
-int pull_word(char *origin_search_words, int * connfd) {
+int pull_word(char *origin_search_words, int *connfd) {
 
     pthread_mutex_t pull_word_cond_mtx = PTHREAD_MUTEX_INITIALIZER;
     //新建一个条件锁，等待被触发
@@ -501,67 +584,84 @@ int pull_word(char *origin_search_words, int * connfd) {
                                            (void *) _tree_cut_words, parent_tree_cut_words_data);
 
     //结果校验while，pthread_cond_wait可能被意外唤醒
-    while (*((*parent_tree_cut_words_data).pullwords_result_number) != *((*parent_tree_cut_words_data).pullwords_result_finish_number)){
+    while (*((*parent_tree_cut_words_data).pullwords_result_number) !=
+           *((*parent_tree_cut_words_data).pullwords_result_finish_number)) {
         //阻塞等待子进程通知
         pthread_cond_wait(&pullwords_cond, &pull_word_cond_mtx);
     }
 
-
     char last_result_words[WORD_RESULT_LEN];
-    memset(last_result_words,0,WORD_RESULT_LEN);
+    memset(last_result_words, 0, WORD_RESULT_LEN);
     //接受到通知开始处理分词作业检查
     deal_pullwords_result_queue(pullwords_result_queue, last_result_words);
-   // strcat(last_result_words,"\n");
+    // strcat(last_result_words,"\n");
     printf("last result_words is %s\n", last_result_words);
     free(pullwords_result_queue);
 
-    write(*connfd, last_result_words, sizeof(last_result_words)); //write maybe fail,here don't process failed error
+    //sendString(last_result_words, connfd);
+    //sendHeader("200 OK", "text/html; charset=utf-8",MAX_SEARCH_WORDS_LEN, *connfd);
+
+    sendString(last_result_words, *connfd);
+
+    //write(*connfd, last_result_words, sizeof(last_result_words)); //write maybe fail,here don't process failed error
 
     free(origin_search_words);
+    close(*connfd);
     return 0;
 };
 
-void deal_pullwords_request(int connfd) {
+void deal_pullwords_request(int *connfd) {
 
     size_t n;
-    char client_request_data[MAX_SEARCH_WORDS_LEN];
-    memset(client_request_data, 0, MAX_SEARCH_WORDS_LEN);
-    for (; ;) {
-        n = read(connfd, client_request_data, MAX_SEARCH_WORDS_LEN);
+    char client_request_data[HTTP_REQUEST_LEN];
+    memset(client_request_data, 0, HTTP_REQUEST_LEN);
 
-        if (n < 0) {
-            if (errno != EINTR) {
-                perror("read error");
-                break;
-            }
-        }
-        if (n == 0) {
-            //connfd is closed by client
-            close(connfd);
-            printf("client exit\n");
-            break;
-        }
-        //client exit
-        if (strncmp("exit", client_request_data, 4) == 0) {
-            close(connfd);
-            printf("client exit\n");
-            break;
-        }
+    n = read(*connfd, client_request_data, HTTP_REQUEST_LEN);
 
-        printf("client input %s\n", client_request_data);
-
-        /*
-         * Todo
-         * 这里创建一个线程来处理,考虑需不需要返回原搜索词跟ip，先做hproxy代理再考虑这个
-         * */
-        char * search_words = (char *) malloc(MAX_SEARCH_WORDS_LEN);
-        memset(search_words,0,MAX_SEARCH_WORDS_LEN);
-        strcpy(search_words,client_request_data);
-        pull_word(search_words, &connfd);
+    if (n < 0) {
+        if (errno != EINTR) {
+            perror("read error");
+        }
     }
+    if (n == 0) {
+        //connfd is closed by client
+        close(*connfd);
+        printf("client exit\n");
+    }
+    //client exit
+    if (strncmp("exit", client_request_data, 4) == 0) {
+        close(*connfd);
+        printf("client exit\n");
+    }
+
+
+
+    /*
+     * Todo
+     * 提取出http报文的搜索词
+     * */
+    char *search_words = (char *) malloc(MAX_SEARCH_WORDS_LEN);
+    memset(search_words, 0, MAX_SEARCH_WORDS_LEN);
+    get_search_words(client_request_data, search_words);
+    printf("client input search_words %s\n", search_words);
+
+    //strcpy(search_words, client_request_data);
+    //strcpy(search_words, "iphone");
+    pull_word(search_words, &(*connfd));
+
+}
+
+sendString(char *message, int socket) {
+    int length, bytes_sent;
+    length = strlen(message);
+
+    bytes_sent = send(socket, message, length, 0);
+
+    return bytes_sent;
 }
 
 int main(int argc, char **argv) {
+
     int listenfd, connfd;
     int serverPort = 9999;
     int listenq = 1024;
@@ -596,7 +696,7 @@ int main(int argc, char **argv) {
         return -1;
     }
 
-    printf("echo server startup,listen on port:%d\n", serverPort);
+    printf("pullwords server startup,listen on port:%d\n", serverPort);
     for (; ;) {
         connfd = accept(listenfd, (struct sockaddr *) &cliaddr, &socklen);
         if (connfd < 0) {
@@ -605,16 +705,16 @@ int main(int argc, char **argv) {
         }
 
         sprintf(buf, "accept form %s:%d\n", inet_ntoa(cliaddr.sin_addr), cliaddr.sin_port);
-        printf(buf, "");
-        childpid = fork();
-        if (childpid == 0) { /* child process */
-            close(listenfd);    /* close listening socket */
-            deal_pullwords_request(connfd);   /* process the request */
-            exit(0);
-        } else if (childpid > 0) {
-            close(connfd);          /* parent closes connected socket */
-        } else {
-            perror("fork error");
+
+
+        //创建线程处理请求
+        pthread_t pthread_id;
+        int pthread_create_result;
+        pthread_create_result = pthread_create(&pthread_id, NULL,
+                                               (void *) deal_pullwords_request, &connfd);
+        if (pthread_create_result != 0) {
+            printf("pthread_create error.\n");
         }
+
     }
 }
