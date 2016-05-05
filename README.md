@@ -17,10 +17,12 @@ set 背 '{"0":"背包","1":"背景"}'
  ![image](https://github.com/lokenetwork/chinese-participle/blob/master/demo-pictures/chinese-participle.png)
  
 # 此项目后续开发计划。
-1/3 做个后台管理词典，web方式，打算采用node跟一些前端MVC框架，angular之类。
+1/4 做个后台管理词典，web方式，打算采用node跟一些前端MVC框架，angular之类。
 
-2/3 支持mysql商品表导入，输入搜索词，返回分词匹配到的商品ID，支持分页返回。
+2/4 支持mysql商品表导入，输入搜索词，返回分词匹配到的商品ID，支持分页返回。
 
-3/3 开发错误搜索词纠正功能。
+3/4 开发错误搜索词纠正功能。
+
+3/4 支持多机部署，分布式计算。
 
 ........
