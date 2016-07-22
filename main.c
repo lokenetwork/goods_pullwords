@@ -1,720 +1,375 @@
-#include  <unistd.h>
-#include  <sys/types.h>       /* basic system data types */
-#include  <sys/socket.h>      /* basic socket definitions */
-#include  <netinet/in.h>      /* sockaddr_in{} and other Internet defns */
-#include  <arpa/inet.h>       /* inet(3) functions */
-#include<stdio.h>
-#include<string.h>
-#include <stdlib.h>
-#include <errno.h>
-#include <hiredis/hiredis.h>
-#include "cJSON/cJSON.h"
-#include "unidirectional_queue/unidirectional_queue.h"
+#include <stdio.h>
+#include <opencv2/opencv.hpp>
+#include <zconf.h>
+#include <cerrno>
 
-/*
- * Todo
- * 1,把你的字符串操作写成库，main里面太多函数了
- * */
+using namespace cv;
+using namespace std;
+#define handle_error_en(en, msg) \
+               do { errno = en; perror(msg); exit(EXIT_FAILURE); } while (0)
+//图片像素结构体
+struct picture_pix {
+    int B;
+    int G;
+    int R;
 
-#define PCRE2_CODE_UNIT_WIDTH 8
+    int location_row; //该像素处于图像的第几行
+    int start_offset; //该像素距离本行开头的距离
+    bool is_word_pix; //是否是字体像素
+    struct picture_pix *next_pix; //下一个像素
+    struct picture_pix *prev_pix; //前一个像素
 
-#include <pcre2.h>
-#include <pthread.h>
-#include <strings.h>
-#include <stdbool.h>
-
-
-const char *english_pattern = "^[^\u4e00-\u9fa5]++";
-
-//typedef struct sockaddr  SA;
-const int8_t chinese_word_byte = sizeof("字") - 1;
-const int8_t chinese_char_byte = sizeof("字");
-const char *redis_get_common = "get ";
-struct TREE_CUT_WORDS_STUFF {
-    char *start_word_item;
-    bool have_first_not_cn_word;
-    char *first_not_cn_word;
-    char *had_deal_search_word;
-};
-
-//父线程传参給子线程的结构体
-struct TREE_CUT_WORDS_DATA {
-    //父级的分词结果
-    char *cut_word_result;
-    //原始的remainder_words指针，没有做偏移运算，用来free
-    char *origin_remainder_words;
-    //父级还没处理，剩余的搜索词
-    char *remainder_words;
-    //父级的分词权重
-    int *words_weight;
-
-    //主线程分词队列数组
-    LinkQueue *pullwords_result_queue;
-    //主线程分词队列数组写入锁
-    pthread_mutex_t *pullwords_result_queue_write_lock;
-    //主线程条件锁
-    pthread_cond_t *pullwords_cond;
-    //分词结果数,要用原子操作,支持并发
-    int *pullwords_result_number;
-    //已经分词完毕的结果数
-    int *pullwords_result_finish_number;
 };
 
 
-char *substring(char *ch, int pos, int length) {
-    char *pch = ch;
-//定义一个字符指针，指向传递进来的ch地址。
-    char *subch = (char *) calloc(sizeof(char), length + 1);
-//通过calloc来分配一个length长度的字符数组，返回的是字符指针。
-    int i;
-//只有在C99下for循环中才可以声明变量，这里写在外面，提高兼容性。
-    pch = pch + pos;
-//是pch指针指向pos位置。
-    for (i = 0; i < length; i++) {
-        subch[i] = *(pch++);
-//循环遍历赋值数组。
-    }
-    subch[length] = '\0';//加上字符串结束符。
-    return subch;       //返回分配的字符数组地址。
-}
-
-//初始化分词结果结构体
-void init_tree_cut_words_data(struct TREE_CUT_WORDS_DATA *cut_words_data) {
-    (*cut_words_data).cut_word_result = (char *) malloc(WORD_RESULT_LEN);
-    memset((*cut_words_data).cut_word_result, 0, WORD_RESULT_LEN);
-    (*cut_words_data).words_weight = (int *) malloc(sizeof(int));
-    memset((*cut_words_data).words_weight, 0, sizeof(int));
-    (*cut_words_data).remainder_words = (char *) malloc(MAX_SEARCH_WORDS_LEN);
-    memset((*cut_words_data).remainder_words, 0, MAX_SEARCH_WORDS_LEN);
-    (*cut_words_data).origin_remainder_words = (*cut_words_data).remainder_words;
-}
-
-void get_search_words(char *http_request, char *search_wrods) {
-    char search_words_key[20] = "search_words";
-    char *search_words_position;
-    char *search_words_origin_position;
-    search_words_position = strstr(http_request, search_words_key);
-    search_words_origin_position = search_words_position =
-            search_words_position + strlen(search_words_key) + strlen("=");
-    int search_wrods_lenght;
-    //从这个指针位置开始读取读,取到空格要停止
-    for (int i = 0; i < MAX_SEARCH_WORDS_LEN; i++) {
-        search_words_position++;
-        if ((*search_words_position) == ' ') {
-            search_wrods_lenght = i + 1;
-            break;
-        }
-
-    };
-    strncpy(search_wrods, search_words_origin_position, search_wrods_lenght);
-}
-
-void add_words_weight(int *weight, int type) {
-    switch (type) {
-        case 1:
-            *weight += 5;
-            break;
-        case 2:
-            *weight += 10;
-            break;
-    }
-}
-
-/*从字符串的左边截取n个字符*/
-char *left(char *dst, char *src, int n) {
-    char *p = src;
-    char *q = dst;
-    int len = strlen(src);
-    if (n > len) n = len;
-    while (n--) *(q++) = *(p++);
-    *(q++) = '\0'; /*有必要吗？很有必要*/
-    return dst;
-}
-
-/*方法一，不改变字符串a,b, 通过malloc，生成第三个字符串c, 返回局部指针变量*/
-char *join_char(const char *a, const char *b) {
-    char *c = (char *) malloc(strlen(a) + strlen(b) + 1); //局部变量，用malloc申请内存
-    memset(c, 0, strlen(a) + strlen(b) + 1);
-    if (c == NULL) exit(1);
-    char *tempc = c; //把首地址存下来
-    while (*a != '\0') {
-        *c++ = *a++;
-    }
-    while ((*c++ = *b++) != '\0') { ;
-    }
-    //注意，此时指针c已经指向拼接之后的字符串的结尾'\0' !
-    return tempc;//返回值是局部malloc申请的指针变量，需在函数调用结束后free之
-}
-
-/*
- * return 1: success
- * return 0: error;
- * */
-int8_t pecl_regx_match(PCRE2_SPTR subject, PCRE2_SPTR pattern, int *match_offset, int *match_str_lenght) {
-
-    pcre2_code *re;
-    PCRE2_SPTR name_table;
-
-    int crlf_is_newline;
-    int errornumber;
-    int i;
-    int namecount;
-    int name_entry_size;
-    int rc;
-    int utf8;
-
-    uint32_t option_bits;
-    uint32_t newline;
-
-    PCRE2_SIZE erroroffset;
-    PCRE2_SIZE *ovector;
-
-    size_t subject_length;
-    pcre2_match_data *match_data;
-
-
-
-    //char * _pattern = "[2-9]";
-    char *_pattern = "[^\u4e00-\u9fa5]++";
-
-    subject_length = strlen((char *) subject);
-
-    re = pcre2_compile(
-            pattern,               /* the pattern */
-            PCRE2_ZERO_TERMINATED, /* indicates pattern is zero-terminated */
-            0,                     /* default options */
-            &errornumber,          /* for error number */
-            &erroroffset,          /* for error offset */
-            NULL);                 /* use default compile context */
-
-    if (re == NULL) {
-        PCRE2_UCHAR buffer[256];
-        pcre2_get_error_message(errornumber, buffer, sizeof(buffer));
-        printf("PCRE2 compilation failed at offset %d: %s\n", (int) erroroffset,
-               buffer);
-        return 0;
-    }
-
-    match_data = pcre2_match_data_create_from_pattern(re, NULL);
-
-    rc = pcre2_match(
-            re,                   /* the compiled pattern */
-            subject,              /* the subject string */
-            subject_length,       /* the length of the subject */
-            0,                    /* start at offset 0 in the subject */
-            0,                    /* default options */
-            match_data,           /* block for storing the result */
-            NULL);                /* use default match context */
-    if (rc < 0) {
-        switch (rc) {
-            case PCRE2_ERROR_NOMATCH:
-                break;
-                /*
-                Handle other special cases if you like
-                */
-            default:
-                printf("Matching error %d\n", rc);
-                break;
-        }
-        pcre2_match_data_free(match_data);   /* Release memory used for the match */
-        pcre2_code_free(re);                 /* data and the compiled pattern. */
-        return 0;
-    }
-    ovector = pcre2_get_ovector_pointer(match_data);
-    *match_offset = (int) ovector[0];
-
-
-    if (rc == 0) {
-        printf("ovector was not big enough for all the captured substrings\n");
-    }
-    for (i = 0; i < rc; i++) {
-        size_t substring_length = ovector[2 * i + 1] - ovector[2 * i];
-        *match_str_lenght = (int) substring_length;
-
-
-        PCRE2_SPTR substring_start = subject + ovector[2 * i];
-
-        if (i > 1) {
-            //wrong. i can't large than one.todo.
-        }
-    }
-}
-
-void add_word_item_to_single_tree_result(char *tree_result, const char *word_item) {
-    strcat(tree_result, ",");
-    strcat(tree_result, word_item);
-}
-
-//中文裁剪
-void chinese_word_cut(char *tree_result_word, char **search_word_point, int *words_weight, const char *chinese_words) {
-    strcat(tree_result_word, ",");
-    strcat(tree_result_word, chinese_words);
-    add_words_weight(words_weight, 2);
-    //搜索词前进
-    *search_word_point = *search_word_point + strlen(chinese_words);
-}
-
-//匹配不到redis词条最后裁剪方法
-void not_match_word_end_cut(char *tree_result_word, char **search_word_point, int *words_weight) {
-    strcat(tree_result_word, ",");
-    strcat(tree_result_word, *search_word_point);
-    add_words_weight(words_weight, 1);
-    //搜索词前进
-    int remain_word_lenght = (int) strlen(*search_word_point);
-    *search_word_point = *search_word_point + remain_word_lenght;
-}
-
-
-void get_redis_connect(redisContext **redis_connect) {
-    *redis_connect = redisConnect("127.0.0.1", 6379);
-    if (redis_connect == NULL || (*redis_connect)->err) {
-        if (redis_connect) {
-            printf("Error: %s\n", (*redis_connect)->errstr);
-            // handle error
-        } else {
-            printf("Can't allocate redis context\n");
-        }
-    }
-}
-
-
-/*
- * 裁剪英文作为一个词,
- * 1 STAND FOR SUCCESS,
- * 小于1代表失败
- **/
-int english_word_cut(char *tree_result_word, char **search_word_point, int *words_weight) {
-    int not_chinese_match_offset, not_chinese_match_str_lenght;
-    int pecl_regx_match_result = pecl_regx_match((PCRE2_SPTR) (*search_word_point), (PCRE2_SPTR) english_pattern,
-                                                 &not_chinese_match_offset,
-                                                 &not_chinese_match_str_lenght);
-
-    //匹配到英文先处理英文
-    if (pecl_regx_match_result > 0) {
-        add_words_weight(words_weight, 2);
-        //取出非中文
-        char not_chinese_word[not_chinese_match_str_lenght + 1];
-        memset(not_chinese_word, 0, not_chinese_match_str_lenght + 1);
-        strncpy(not_chinese_word, *search_word_point, not_chinese_match_str_lenght);
-        strcat(not_chinese_word, "\0");
-        add_word_item_to_single_tree_result(tree_result_word, not_chinese_word);
-        *search_word_point =
-                *search_word_point + not_chinese_match_str_lenght;
-
-    }
-    return 1;
-}
-
-void sendHeader(char *Status_code, char *Content_Type, int TotalSize, int socket) {
-    char *head = "\r\nHTTP/1.1 ";
-    char *content_head = "\r\nContent-Type: ";
-    char *server_head = "\r\nServer: PT06";
-    char *length_head = "\r\nContent-Length: ";
-    char *date_head = "\r\nDate: ";
-    char *newline = "\r\n";
-    char contentLength[100];
-
-    time_t rawtime;
-
-    time(&rawtime);
-
-    // int contentLength = strlen(HTML);
-    sprintf(contentLength, "%i", TotalSize);
-
-    char *message = malloc((
-                                   strlen(head) +
-                                   strlen(content_head) +
-                                   strlen(server_head) +
-                                   strlen(length_head) +
-                                   strlen(date_head) +
-                                   strlen(newline) +
-                                   strlen(Status_code) +
-                                   strlen(Content_Type) +
-                                   strlen(contentLength) +
-                                   28 +
-                                   sizeof(char)) * 2);
-
-    if (message != NULL) {
-
-        strcpy(message, head);
-
-        strcat(message, Status_code);
-
-        strcat(message, content_head);
-        strcat(message, Content_Type);
-        strcat(message, server_head);
-        strcat(message, length_head);
-        strcat(message, contentLength);
-        strcat(message, date_head);
-        strcat(message, (char *) ctime(&rawtime));
-        strcat(message, newline);
-
-        sendString(message, socket);
-
-        free(message);
-    }
-}
-
-//有多少个词条就开多少个线程来模拟分叉树算法，选出词条最多的一个或几个作为分词结果
-int _tree_cut_words(struct TREE_CUT_WORDS_DATA *parent_cut_words_data) {
-
-    english_word_cut((*parent_cut_words_data).cut_word_result, &((*parent_cut_words_data).remainder_words),
-                     (*parent_cut_words_data).words_weight);
-
-    //取出第一个汉子，查询redis词条，for循环生产不同的父级分词结果，然后传给新建的子进程,进入递归
-    char *first_chinese_word;
-    first_chinese_word = (char *) malloc(chinese_char_byte);
-    memset(first_chinese_word, 0, chinese_char_byte);
-    if (!first_chinese_word) {
-        //todo.每一个可能的错误都要做处理或日志记录.not only malloc
-        printf("Not Enough Memory!/n");
-    }
-
-    strncpy(first_chinese_word, parent_cut_words_data->remainder_words, chinese_word_byte);
-    strcat(first_chinese_word, "\0");
-    char *get_word_item_cmd = join_char(redis_get_common, first_chinese_word);
-
-    //用完释放内存
-    free(first_chinese_word);
-
-    redisContext *redis_connect;
-    get_redis_connect(&redis_connect);
-
-    redisReply *redis_reply = redisCommand(redis_connect, get_word_item_cmd);
-    char *match_words_json_str = redis_reply->str;
-    free(get_word_item_cmd);
-    cJSON *match_words_json = cJSON_Parse(match_words_json_str);
-
-    //是否已经到最后一个词
-    bool NEED_not_match_word_end_cut;
-
-    //有多少词条是否包含在搜索词里
-    int8_t match_words_item_number = 0;
-
-    //判断是否查找到redis词条
-    if (redis_reply->type == REDIS_REPLY_STRING) {
-        //pullwords_result_number要先计算好有多少种结果。
-        for (int tree_arg_index = 0; tree_arg_index < cJSON_GetArraySize(match_words_json); tree_arg_index++) {
-            cJSON *subitem = cJSON_GetArrayItem(match_words_json, tree_arg_index);
-            //判断词条是否包含在搜索词里
-            if (strstr(parent_cut_words_data->remainder_words, subitem->valuestring) != NULL) {
-                match_words_item_number++;
-            }
-        };
-    } else {
-        NEED_not_match_word_end_cut = false;
-    }
-
-
-    if (match_words_item_number == 0) {
-        NEED_not_match_word_end_cut = true;
-    }
-
-    if (NEED_not_match_word_end_cut == false) {
-        int8_t add_result_number = 0;
-        //pullwords_result_number要做原子操作，递增，支持并发
-        add_result_number = match_words_item_number - 1;
-        __sync_fetch_and_add((*parent_cut_words_data).pullwords_result_number, add_result_number);
-        for (int tree_arg_index = 0; tree_arg_index < cJSON_GetArraySize(match_words_json); tree_arg_index++) {
-            cJSON *subitem = cJSON_GetArrayItem(match_words_json, tree_arg_index);
-            //判断词条是否包含在搜索词里,如果在，进入树分词算法
-            if (strstr(parent_cut_words_data->remainder_words, subitem->valuestring) != NULL) {
-
-                //复制一份分词结果,生出父级分词结果
-                struct TREE_CUT_WORDS_DATA *tree_cut_words_data = (struct TREE_CUT_WORDS_DATA *) malloc(
-                        sizeof(struct TREE_CUT_WORDS_DATA));
-                memset(tree_cut_words_data, 0, sizeof(struct TREE_CUT_WORDS_DATA));
-                init_tree_cut_words_data(tree_cut_words_data);
-
-                strcpy(tree_cut_words_data->cut_word_result, parent_cut_words_data->cut_word_result);
-                strcpy(tree_cut_words_data->remainder_words, parent_cut_words_data->remainder_words);
-                *tree_cut_words_data->words_weight = *(parent_cut_words_data->words_weight);
-
-                //todo 把pullwords主线程的data封装成一个指针，减少指针创建,.
-                tree_cut_words_data->pullwords_result_queue = parent_cut_words_data->pullwords_result_queue;
-                tree_cut_words_data->pullwords_result_queue_write_lock = parent_cut_words_data->pullwords_result_queue_write_lock;
-                tree_cut_words_data->pullwords_cond = parent_cut_words_data->pullwords_cond;
-                (*tree_cut_words_data).pullwords_result_number = (*parent_cut_words_data).pullwords_result_number;
-                (*tree_cut_words_data).pullwords_result_finish_number = (*parent_cut_words_data).pullwords_result_finish_number;
-
-                chinese_word_cut(tree_cut_words_data->cut_word_result, &(tree_cut_words_data->remainder_words),
-                                 tree_cut_words_data->words_weight, subitem->valuestring);
-
-                //还有词没分完，进入递归分词
-                if (strlen(tree_cut_words_data->remainder_words) > 0) {
-                    pthread_t pthread_id;
-                    int pthread_create_result;
-                    pthread_create_result = pthread_create(&pthread_id, NULL,
-                                                           (void *) _tree_cut_words, tree_cut_words_data);
-                    if (pthread_create_result != 0) {
-                        //todo,deal the error,.
-                        printf("Create pthread error!\n");
-                    }
-                } else {
-                    //创建线程最终分词结果，写入主线程队列
-                    struct TREE_CUT_WORDS_RESULT *last_tree_cut_words_result = (struct TREE_CUT_WORDS_RESULT *) malloc(
-                            sizeof(struct TREE_CUT_WORDS_RESULT));
-                    memset(last_tree_cut_words_result, 0, sizeof(struct TREE_CUT_WORDS_RESULT));
-                    strcpy(last_tree_cut_words_result->pullwords_result, tree_cut_words_data->cut_word_result);
-                    last_tree_cut_words_result->words_weight = *(tree_cut_words_data->words_weight);
-
-
-                    //分词结束，加锁，写入分词结果到主线程的分词队列
-                    pthread_mutex_lock(tree_cut_words_data->pullwords_result_queue_write_lock);
-
-                    EnQueue((*tree_cut_words_data).pullwords_result_queue, last_tree_cut_words_result);
-                    *((*parent_cut_words_data).pullwords_result_finish_number) =
-                            (*((*parent_cut_words_data).pullwords_result_finish_number)) + 1;
-
-                    //加锁比较pullwords_result_finish_number跟pullwords_result_number，如果全部作业完成，通知主进程
-                    if (*((*parent_cut_words_data).pullwords_result_finish_number) ==
-                        *((*parent_cut_words_data).pullwords_result_number)) {
-                        pthread_cond_signal((*parent_cut_words_data).pullwords_cond);
-                    }
-                    pthread_mutex_unlock(tree_cut_words_data->pullwords_result_queue_write_lock);
-                }
-            }
-
-        }
-    } else {
-        //首汉子没有匹配到字典词条 OR 没有查找到redis词条，选取剩下的字作为一个半词
-        not_match_word_end_cut(parent_cut_words_data->cut_word_result, &(parent_cut_words_data->remainder_words),
-                               parent_cut_words_data->words_weight);
-        //创建线程最终分词结果，写入主线程队列
-        struct TREE_CUT_WORDS_RESULT *last_tree_cut_words_result = (struct TREE_CUT_WORDS_RESULT *) malloc(
-                sizeof(struct TREE_CUT_WORDS_RESULT));
-        memset(last_tree_cut_words_result, 0, sizeof(struct TREE_CUT_WORDS_RESULT));
-        strcpy(last_tree_cut_words_result->pullwords_result, parent_cut_words_data->cut_word_result);
-        last_tree_cut_words_result->words_weight = *(parent_cut_words_data->words_weight);
-
-
-
-        //分词结束，加锁，写入分词结果到主线程的分词队列
-        pthread_mutex_lock(parent_cut_words_data->pullwords_result_queue_write_lock);
-        EnQueue((*parent_cut_words_data).pullwords_result_queue, last_tree_cut_words_result);
-        *((*parent_cut_words_data).pullwords_result_finish_number) =
-                (*((*parent_cut_words_data).pullwords_result_finish_number)) + 1;
-
-
-        //加锁比较pullwords_result_finish_number跟pullwords_result_number，如果全部作业完成，通知主进程
-        if (*((*parent_cut_words_data).pullwords_result_finish_number) ==
-            *((*parent_cut_words_data).pullwords_result_number)) {
-            pthread_cond_signal((*parent_cut_words_data).pullwords_cond);
-        }
-        pthread_mutex_unlock(parent_cut_words_data->pullwords_result_queue_write_lock);
-    }
-
-
-    free(parent_cut_words_data->cut_word_result);
-    free(parent_cut_words_data->words_weight);
-    free(parent_cut_words_data->origin_remainder_words);
-    free(parent_cut_words_data);
-
-
-    return 0;
-}
-
-/*
- * 处理分词队列函数
- * */
-void deal_pullwords_result_queue(LinkQueue *pullwords_result_queue, char *result_words) {
-    //从队首至队尾遍历队列Q中的元素
-    QueuePtr p;
-    p = (*pullwords_result_queue).front->next;
-    if (p == NULL) {
-        printf("QueuePtr ERROR \n");
-    }
-
-    char temporary_result_words[MAX_SEARCH_WORDS_LEN];
-    memset(temporary_result_words, 0, MAX_SEARCH_WORDS_LEN);
-    int temporary_words_weight = 0;
-    while (p != NULL) {//遍历队
-        if (p->data->words_weight > temporary_words_weight) {
-            temporary_words_weight = p->data->words_weight;
-            strcpy(temporary_result_words, p->data->pullwords_result);
-        }
-        p = p->next;
-    }
-    char *not_finish_result_words = substring(temporary_result_words, 1, sizeof(temporary_result_words) - 1);
-    strcpy(result_words, not_finish_result_words);
-    free(not_finish_result_words);
-}
-
-int pull_word(char *origin_search_words, int *connfd) {
-
-    pthread_mutex_t pull_word_cond_mtx = PTHREAD_MUTEX_INITIALIZER;
-    //新建一个条件锁，等待被触发
-    pthread_cond_t pullwords_cond = PTHREAD_COND_INITIALIZER;
-
-    char option;
-    LinkQueue *pullwords_result_queue = (LinkQueue *) malloc(sizeof(LinkQueue));
-    memset(pullwords_result_queue, 0, sizeof(LinkQueue));
-    InitQueue(pullwords_result_queue);
-    //每处理一个分词请求建立一个写入锁，防止覆盖，跟多个分词请求的相互干扰
-    pthread_mutex_t pullwords_result_queue_write_lock = PTHREAD_MUTEX_INITIALIZER;
-
-
-
-    //定义父级树分词结果
-    struct TREE_CUT_WORDS_DATA *parent_tree_cut_words_data = (struct TREE_CUT_WORDS_DATA *) malloc(
-            sizeof(struct TREE_CUT_WORDS_DATA));
-    init_tree_cut_words_data(parent_tree_cut_words_data);
-    //封装成一个函数，start
-    parent_tree_cut_words_data->pullwords_result_queue = pullwords_result_queue;
-    parent_tree_cut_words_data->pullwords_result_queue_write_lock = &pullwords_result_queue_write_lock;
-    parent_tree_cut_words_data->pullwords_cond = &pullwords_cond;
-    (*parent_tree_cut_words_data).pullwords_result_number = (int *) malloc(sizeof(int8_t));
-    memset((*parent_tree_cut_words_data).pullwords_result_number, 0, sizeof(int8_t));
-    (*parent_tree_cut_words_data).pullwords_result_finish_number = (int *) malloc(sizeof(int8_t));
-    memset((*parent_tree_cut_words_data).pullwords_result_finish_number, 0, sizeof(int8_t));
-    *((*parent_tree_cut_words_data).pullwords_result_number) = 1;
-    *((*parent_tree_cut_words_data).pullwords_result_finish_number) = 0;
-    //封装成一个函数，end
-
-    //strcpy(parent_tree_cut_words_data->remainder_words, "iphone6s飞行员A9墨镜");
-    strcpy(parent_tree_cut_words_data->remainder_words, origin_search_words);
-
-    //加锁
-    pthread_mutex_lock(&pull_word_cond_mtx);
-
-    //新开一个线程进行分词，每一个子分词线程都继承父级线程分词的结果
-    int pthread_create_result;
-    pthread_t parent_thread_id;
-    pthread_create_result = pthread_create(&parent_thread_id, NULL,
-                                           (void *) _tree_cut_words, parent_tree_cut_words_data);
-
-    //结果校验while，pthread_cond_wait可能被意外唤醒
-    while (*((*parent_tree_cut_words_data).pullwords_result_number) !=
-           *((*parent_tree_cut_words_data).pullwords_result_finish_number)) {
-        //阻塞等待子进程通知
-        pthread_cond_wait(&pullwords_cond, &pull_word_cond_mtx);
-    }
-
-    char last_result_words[WORD_RESULT_LEN];
-    memset(last_result_words, 0, WORD_RESULT_LEN);
-    //接受到通知开始处理分词作业检查
-    deal_pullwords_result_queue(pullwords_result_queue, last_result_words);
-    // strcat(last_result_words,"\n");
-    printf("last result_words is %s\n", last_result_words);
-    free(pullwords_result_queue);
-
-    //sendString(last_result_words, connfd);
-    //sendHeader("200 OK", "text/html; charset=utf-8",MAX_SEARCH_WORDS_LEN, *connfd);
-
-    sendString(last_result_words, *connfd);
-
-    //write(*connfd, last_result_words, sizeof(last_result_words)); //write maybe fail,here don't process failed error
-
-    free(origin_search_words);
-    close(*connfd);
-    return 0;
+//把openc的矩阵转成咱们的结构体
+int transform_to_mstrcut(Mat &I, struct picture_pix **pic_pix);
+
+//todo，判断当前像素是否是字体像素，以后可能要根据前后的连续像素做判断，先封装成函数
+int check_is_word_pix(struct picture_pix *backgound_pix, struct picture_pix *current_pix);
+
+void *thread_check_top_big_bottom(void *arg);
+
+void check_top_big_bottom(bool *top_big_bottom, int I_rows, int I_cols, struct picture_pix *first_pix);
+
+struct thread_top_big_bottom_check_strcut {
+    int start_index;
+    int end_index;
+    int *distance_array;
+    bool *top_big_bottom;
+    //条件，用于结果完成，通知
+    pthread_cond_t * check_top_big_bottom_cond;
+    int * tourch_min_center_calculate_num_count;
 };
-
-void deal_pullwords_request(int *connfd) {
-
-    size_t n;
-    char client_request_data[HTTP_REQUEST_LEN];
-    memset(client_request_data, 0, HTTP_REQUEST_LEN);
-
-    n = read(*connfd, client_request_data, HTTP_REQUEST_LEN);
-
-    if (n < 0) {
-        if (errno != EINTR) {
-            perror("read error");
-        }
-    }
-    if (n == 0) {
-        //connfd is closed by client
-        close(*connfd);
-        printf("client exit\n");
-    }
-    //client exit
-    if (strncmp("exit", client_request_data, 4) == 0) {
-        close(*connfd);
-        printf("client exit\n");
-    }
-
-
-
-    /*
-     * Todo
-     * 提取出http报文的搜索词
-     * */
-    char *search_words = (char *) malloc(MAX_SEARCH_WORDS_LEN);
-    memset(search_words, 0, MAX_SEARCH_WORDS_LEN);
-    get_search_words(client_request_data, search_words);
-    printf("client input search_words %s\n", search_words);
-
-    //strcpy(search_words, client_request_data);
-    //strcpy(search_words, "iphone");
-    pull_word(search_words, &(*connfd));
-
-}
-
-sendString(char *message, int socket) {
-    int length, bytes_sent;
-    length = strlen(message);
-
-    bytes_sent = send(socket, message, length, 0);
-
-    return bytes_sent;
-}
+//二值化计算像素数量最少值，超过这阀值做中间计算才有价值。
+int min_center_calculate_num = 10;
 
 int main(int argc, char **argv) {
 
-    int listenfd, connfd;
-    int serverPort = 9999;
-    int listenq = 1024;
-    pid_t childpid;
-    char buf[MAX_SEARCH_WORDS_LEN];
-    socklen_t socklen;
-
-    struct sockaddr_in cliaddr, servaddr;
-    socklen = sizeof(cliaddr);
-
-    bzero(&servaddr, sizeof(servaddr));
-    servaddr.sin_family = AF_INET;
-    servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
-    servaddr.sin_port = htons(serverPort);
-
-    listenfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (listenfd < 0) {
-        perror("socket error");
+    if (argc < 2) {
+        cout << "Not enough parameters" << endl;
         return -1;
     }
 
-    int on = 1;
-    setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+    Mat I, J;
+
+    I = imread(argv[1], CV_LOAD_IMAGE_COLOR);
+    //cout << "E = " << endl << " " << I << endl << endl;
 
 
-    if (bind(listenfd, (struct sockaddr *) &servaddr, socklen) < 0) {
-        perror("bind error");
+    if (!I.data) {
+        cout << "The image" << argv[1] << " could not be loaded." << endl;
         return -1;
     }
-    if (listen(listenfd, listenq) < 0) {
-        perror("listen error");
-        return -1;
+
+    struct picture_pix *first_pix;
+    transform_to_mstrcut(I, &first_pix);
+
+    //todo,二值计算要封装成函数
+    bool top_big_bottom = true;
+    //触碰到最小阀值的次数，必须触碰两次
+    int tourch_min_center_calculate_num_count = 0;
+    pthread_mutex_t check_top_big_bottom_cond_mtx = PTHREAD_MUTEX_INITIALIZER;
+    //新建一个条件锁，等待被触发
+    pthread_cond_t check_top_big_bottom_cond = PTHREAD_COND_INITIALIZER;
+    //加锁
+    pthread_mutex_lock(&check_top_big_bottom_cond_mtx);
+
+    check_top_big_bottom(&top_big_bottom, I.rows, I.cols, first_pix,&check_top_big_bottom_cond,&tourch_min_center_calculate_num_count);
+
+    //结果校验while，pthread_cond_wait可能被意外唤醒
+    while (tourch_min_center_calculate_num_count < 2) {
+        //阻塞等待子线程通知，触碰两次最小阀值
+        pthread_cond_wait(&check_top_big_bottom_cond, &check_top_big_bottom_cond_mtx);
     }
 
-    printf("pullwords server startup,listen on port:%d\n", serverPort);
-    for (; ;) {
-        connfd = accept(listenfd, (struct sockaddr *) &cliaddr, &socklen);
-        if (connfd < 0) {
-            perror("accept error");
-            continue;
-        }
+    printf("It is end\n");
 
-        sprintf(buf, "accept form %s:%d\n", inet_ntoa(cliaddr.sin_addr), cliaddr.sin_port);
+    sleep(1500);
 
+    return 0;
 
-        //创建线程处理请求
-        pthread_t pthread_id;
-        int pthread_create_result;
-        pthread_create_result = pthread_create(&pthread_id, NULL,
-                                               (void *) deal_pullwords_request, &connfd);
-        if (pthread_create_result != 0) {
-            printf("pthread_create error.\n");
-        }
-
-    }
 }
+
+//判断这个左距离是不是从大到小，是不是呈现对称分布。
+void check_top_big_bottom(bool *top_big_bottom, int I_rows, int I_cols, struct picture_pix *first_pix,pthread_cond_t * check_top_big_bottom_cond,int *tourch_min_center_calculate_num_count) {
+    struct picture_pix *temp_pix = first_pix;
+
+    //获取左侧第一个字体像素相对于行首像素的偏移距离
+    int left_distance_array[I_rows];
+
+    int currnt_left_distance_index = 0;
+    for (int i = 1; i <= I_rows * I_cols; ++i) {
+        //找到一个左侧字体像素，立即跳到下一行
+        if (true == temp_pix->is_word_pix) {
+
+            left_distance_array[currnt_left_distance_index] = temp_pix->start_offset;
+            currnt_left_distance_index++;
+            int current_row = temp_pix->location_row;
+            for (int j = 0; j < I_cols; ++j) {
+                temp_pix = temp_pix->next_pix;
+
+                //已经跳到下一行
+                if (current_row != temp_pix->location_row) {
+                    //返回
+                    break;
+                } else {
+                    //注意，这里不是下一行 才加。
+                    i++;
+                }
+            }
+        } else {
+            temp_pix = temp_pix->next_pix;
+        }
+    }
+    struct thread_top_big_bottom_check_strcut *left_index_data = (struct thread_top_big_bottom_check_strcut *) malloc(
+            sizeof(struct thread_top_big_bottom_check_strcut));
+    left_index_data->start_index = 0;
+    left_index_data->end_index = I_rows - 1;
+    left_index_data->distance_array = left_distance_array;
+    left_index_data->top_big_bottom = top_big_bottom;
+    left_index_data->check_top_big_bottom_cond = check_top_big_bottom_cond;
+    left_index_data->tourch_min_center_calculate_num_count = tourch_min_center_calculate_num_count;
+
+    //start_index 跟end_index 产生变化
+    pthread_t thread_id_check_left_top_big_bottom;
+    int rest = pthread_create(&thread_id_check_left_top_big_bottom, NULL, thread_check_top_big_bottom, left_index_data);
+    if (0 != rest) {
+        handle_error_en(rest, "创建线程失败 ----\n");
+    }
+
+    //获取右侧第一个字体像素相对于行首像素的偏移距离
+    //temp_pix 重新指向头指针。
+    temp_pix = first_pix;
+    int right_distance_array[I_rows];
+    //从最后一个元素往回计算
+    int currnt_right_distance_index = 0;
+    for (int i = 1; i <= I_rows * I_cols; ++i)
+    {
+        //找到一个右侧字体像素，立即跳到上一行
+        if (true == temp_pix->is_word_pix) {
+
+            right_distance_array[currnt_right_distance_index] = I_cols-temp_pix->start_offset;
+            currnt_right_distance_index++;
+            int current_row = temp_pix->location_row;
+            for (int j = 0; j < I_cols; ++j) {
+                temp_pix = temp_pix->prev_pix;
+
+                //已经跳到下一行
+                if (current_row != temp_pix->location_row) {
+                    //返回
+                    break;
+                } else {
+                    //注意，这里不是下一行 才加。
+                    i++;
+                }
+            }
+        } else {
+            temp_pix = temp_pix->prev_pix;
+        }
+    }
+
+    //倒序一下这个数组
+    for (int k = 0; k< (I_rows/2) ; k++) {
+        int temp = right_distance_array[k];
+        right_distance_array[k] = right_distance_array[I_rows-1-k];
+        right_distance_array[I_rows-1-k] = temp;
+    }
+
+    struct thread_top_big_bottom_check_strcut *right_index_data = (struct thread_top_big_bottom_check_strcut *) malloc(
+            sizeof(struct thread_top_big_bottom_check_strcut));
+    right_index_data->start_index = 0;
+    right_index_data->end_index = I_rows - 1;
+    right_index_data->distance_array = right_distance_array;
+    right_index_data->top_big_bottom = top_big_bottom;
+    right_index_data->check_top_big_bottom_cond = check_top_big_bottom_cond;
+    right_index_data->tourch_min_center_calculate_num_count = tourch_min_center_calculate_num_count;
+
+    //start_index 跟end_index 产生变化
+    pthread_t thread_id_check_right_top_big_bottom;
+    int right_rest = pthread_create(&thread_id_check_right_top_big_bottom, NULL, thread_check_top_big_bottom, right_index_data);
+    if (0 != right_rest) {
+        handle_error_en(right_rest, "创建线程失败 ----\n");
+    }
+
+    //pthread_join(thread_id_check_left_top_big_bottom, NULL);
+    pthread_join(thread_id_check_right_top_big_bottom, NULL);
+
+}
+
+void *thread_check_top_big_bottom(void *data) {
+
+    struct thread_top_big_bottom_check_strcut *index_data = (struct thread_top_big_bottom_check_strcut *) data;
+    float center_value;
+    int next_start_index_1;
+    int next_end_index_1;
+    //判断是奇数还是偶数
+    if (((index_data->end_index + 1) % 2) == 0) {
+        center_value =
+                (index_data->distance_array[(index_data->end_index / 2) - 1] +
+                 index_data->distance_array[(index_data->end_index / 2)]) / 2;
+        next_start_index_1 = index_data->start_index;
+        next_end_index_1 = (index_data->end_index+1) / 2 - 1;
+    } else {
+        center_value = index_data->distance_array[(index_data->end_index) / 2];
+        next_start_index_1 = index_data->start_index;
+        next_end_index_1 = (index_data->end_index) / 2;
+
+    }
+    //start跟end之间超过5个像素再进入递归，5是阀值
+    if (min_center_calculate_num <= (next_end_index_1 - next_start_index_1 - 1)) {
+        int thread_rest;
+        //初始化结构体， 进入递归
+        struct thread_top_big_bottom_check_strcut *next_index_data_1 = (struct thread_top_big_bottom_check_strcut *) malloc(
+                sizeof(struct thread_top_big_bottom_check_strcut));
+        next_index_data_1->start_index = next_start_index_1;
+        next_index_data_1->end_index = next_end_index_1;
+        next_index_data_1->distance_array = index_data->distance_array;
+        next_index_data_1->top_big_bottom = index_data->top_big_bottom;
+
+        //thread_check_top_big_bottom(next_index_data_1);
+        pthread_t thread_id;
+        thread_rest = pthread_create(&thread_id, NULL, thread_check_top_big_bottom, next_index_data_1);
+        if (0 != thread_rest) {
+            handle_error_en(thread_rest, "pthread_create 3");
+        }
+
+        int next_start_index_2 = (index_data->end_index) / 2;
+        int next_end_index_2 = index_data->end_index;
+
+        //初始化结构体， 进入递归
+        struct thread_top_big_bottom_check_strcut *next_index_data_2 = (struct thread_top_big_bottom_check_strcut *) malloc(
+                sizeof(struct thread_top_big_bottom_check_strcut));
+        next_index_data_2->start_index = next_start_index_2;
+        next_index_data_2->end_index = next_end_index_2;
+        next_index_data_2->distance_array = index_data->distance_array;
+        next_index_data_2->top_big_bottom = index_data->top_big_bottom;
+
+        //thread_check_top_big_bottom(next_index_data_2);
+        pthread_t thread_id_2;
+        int thread_rest_2 = pthread_create(&thread_id_2, NULL, thread_check_top_big_bottom, next_index_data_2);
+
+        if (0 != thread_rest_2) {
+            handle_error_en(thread_rest_2, "pthread_create 4");
+        }
+
+    }else{
+        //触碰阀值
+        __sync_fetch_and_add(index_data->tourch_min_center_calculate_num_count, 1);
+        if( 2 == *(index_data->tourch_min_center_calculate_num_count)  ){
+            pthread_cond_signal(index_data->check_top_big_bottom_cond);
+        }
+    }
+
+    if (index_data->distance_array[index_data->end_index] > center_value ||
+        index_data->distance_array[index_data->start_index] < center_value) {
+        *((*index_data).top_big_bottom) = false;
+    }
+    free(index_data);
+
+}
+
+int transform_to_mstrcut(Mat &I, struct picture_pix **first_pix) {
+    // accept only char type matrices
+    CV_Assert(I.depth() == CV_8U);
+
+    int channels = I.channels();
+
+    int nRows = I.rows;
+    int nCols = I.cols * channels;
+
+    if (I.isContinuous()) {
+        nCols *= nRows;
+        nRows = 1;
+        int i, j;
+        uchar *p;
+        int current_pix = 1; //现在遍历到那个像素了
+        int pix_number = I.rows * I.cols; //全部的像素数量
+        for (i = 0; i < nRows; ++i) {
+            p = I.ptr<uchar>(i);
+            //选取第一点作为背景色
+            struct picture_pix background_pix;
+            background_pix.B = p[0];
+            background_pix.G = p[1];
+            background_pix.R = p[2];
+
+            struct picture_pix *pix_array[pix_number];
+
+            for (int current_pix_index = 1; current_pix_index <= pix_number; ++current_pix_index) {
+
+                pix_array[current_pix_index - 1] = (struct picture_pix *) malloc(sizeof(struct picture_pix));
+
+                int B_index = current_pix_index * 3 - 3;
+                int G_index = current_pix_index * 3 - 2;
+                int R_index = current_pix_index * 3 - 1;
+
+
+                pix_array[current_pix_index - 1]->B = p[B_index];
+                pix_array[current_pix_index - 1]->G = p[G_index];
+                pix_array[current_pix_index - 1]->R = p[R_index];
+
+                float temp_location_row = (float) current_pix_index / (float) I.cols;
+                pix_array[current_pix_index - 1]->location_row = (int) ceil(temp_location_row);
+
+                pix_array[current_pix_index - 1]->start_offset =
+                        current_pix_index - 1 - ((pix_array[current_pix_index - 1]->location_row - 1) * I.cols);
+                check_is_word_pix(&background_pix, pix_array[current_pix_index - 1]);
+
+            }
+            //再循环一次做指针指向
+            for (int current_pix_index = 0; current_pix_index < pix_number; ++current_pix_index) {
+                //头尾指向
+                if (0 == current_pix_index) {
+                    pix_array[current_pix_index]->prev_pix = pix_array[pix_number - 1];
+                } else {
+                    pix_array[current_pix_index]->prev_pix = pix_array[current_pix_index - 1];
+                }
+
+                if ((pix_number - 1) == current_pix_index) {
+                    pix_array[current_pix_index]->next_pix = pix_array[0];
+                } else {
+                    pix_array[current_pix_index]->next_pix = pix_array[current_pix_index + 1];
+                }
+
+            }
+            *first_pix = pix_array[0];
+
+
+        }
+        //todo，非连续的图片暂时不处理
+    } else {
+
+    }
+
+    return 0;
+};
+
+int check_is_word_pix(struct picture_pix *backgound_pix, struct picture_pix *current_pix) {
+    //单色最大差距
+    int single_max_gap = 80;
+    //双色最大差距
+    int double_max_gap = 50;
+    //三色最大差距
+    int three_max_gap = 30;
+
+    int B_gap = abs(backgound_pix->B - current_pix->B);
+    int G_gap = abs(backgound_pix->G - current_pix->G);
+    int R_gap = abs(backgound_pix->R - current_pix->R);
+    //先检测单色的差距
+    if (B_gap > single_max_gap || G_gap > single_max_gap || R_gap > single_max_gap) {
+        current_pix->is_word_pix = true;
+
+    } else if ((B_gap > double_max_gap && G_gap > double_max_gap) ||
+               (B_gap > double_max_gap && R_gap > double_max_gap) ||
+               (G_gap > double_max_gap && R_gap > double_max_gap)) {
+        current_pix->is_word_pix = true;
+    } else if (B_gap > three_max_gap || G_gap > three_max_gap || R_gap > three_max_gap) {
+        current_pix->is_word_pix = true;
+    } else {
+        current_pix->is_word_pix = false;
+    };
+
+    return 0;
+};
+
+
